@@ -2,6 +2,13 @@
 command. Used for first-bringup verification of the round-trip command
 path on real hardware before introducing motion.
 
+MUST be configured with ``loop_mode: fixed_rate`` (with a bounded
+``poll_freq``) when paired with a subscriber_driven RobotNode.
+subscriber_driven on both creates an ungoverned feedback loop that
+swamps the underlying I/O. See incident: rate runaway at 170 kHz on
+Piper, which produced SEND_MESSAGE_FAILED storms on the CAN bus and
+caused unintended motion.
+
 Sourcing the target from the robot's own state stream eliminates the
 unsafe-init-pose class of bug (e.g., DummyAgent's hardcoded init pose
 not matching where the arm physically is at session start). The agent

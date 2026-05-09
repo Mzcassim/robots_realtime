@@ -11,7 +11,10 @@ nodes:
     agent_kwargs:
       state_key: state
       gripper_max_m: 0.1       # matches PiperRobot._gripper_hi default
-    loop_mode: subscriber_driven
+    loop_mode: fixed_rate
+    poll_freq: 50.0            # bounded — no feedback loop with RobotNode
+                               # (agent_node.py:50,95 / node.py:260 — `poll_freq`,
+                               # NOT `publish_freq`, governs the fixed_rate loop)
     state_topics:
       state: piper/joint_state
 
