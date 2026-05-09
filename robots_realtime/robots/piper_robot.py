@@ -98,62 +98,30 @@ class PiperRobot(Robot):
         # wraps an enable cycle in disable_arm → enable_arm. It does NOT set
         # ctrl_mode — the firmware default is STANDBY, where motors energize
         # but the controller does not act on buffered commands (commands
-        # flow in, no motion). Both paths below therefore call set_arm_mode()
-        # explicitly to put ctrl_mode into CAN_COMMAND so the controller
-        # servos buffered targets. The disable_arm step inside reset_arm
-        # briefly cuts motor power, which on a warm/loaded arm causes a
-        # visible gravity drop and risk of self-collision. On a cold arm
-        # (motors already off) it's a no-op.
+        # flow in, no motion). The disable_arm step inside reset_arm briefly
+        # cuts motor power, which on a warm/loaded arm causes a visible
+        # gravity drop and risk of self-collision. On a cold arm (motors
+        # already off) it's a no-op.
         #
-        # The warm path below replicates the same end-state WITHOUT the
-        # disable, in this exact order:
-        #   1. Pre-seed current pose into the firmware command buffer —
-        #      without this, set_arm_mode + enable_arm would commit a
-        #      stale or empty target and snap the arm.
-        #   2. set_arm_mode() flips ctrl_mode from STANDBY to CAN_COMMAND.
-        #   3. enable_arm() energizes the motors (idempotent on warm arm),
-        #      which then servo to the now-fresh buffered target.
-        # Skip reset_arm when _is_warm() reports the arm is fully-enabled
-        # or in STANDBY with energized motors holding pose.
+        # Both paths below end by calling _engage_controller(), which runs
+        # the empirically-correct pre-seed → set_arm_mode → enable_arm
+        # sequence. The cold path additionally runs reset_arm + enable_gripper
+        # first to handle electrical enable; the warm path skips both since
+        # _is_warm() guarantees the arm is already energized. Skip reset_arm
+        # when _is_warm() reports the arm is fully-enabled or in STANDBY
+        # with energized motors holding pose.
         if reset_on_init:
             if self._is_warm():
                 logger.info(
-                    "PiperRobot: arm appears warm; pre-seeding current pose, "
-                    "transitioning controller to POSITION_VELOCITY, and re-enabling "
-                    "arm without disable cycle."
+                    "PiperRobot: arm appears warm; engaging controller "
+                    "without disable cycle."
                 )
-                try:
-                    current_arm = self._iface.get_joint_positions()
-                    current_gripper, _ = self._iface.get_gripper_state()
-                    self._iface.command_joint_positions(current_arm)
-                    self._iface.command_gripper(position=float(current_gripper))
-                    time.sleep(0.2)  # let buffer write propagate before mode/enable
-                except Exception as exc:
-                    raise RuntimeError(
-                        "PiperRobot: failed to pre-seed current pose before warm "
-                        "controller transition. Refusing to proceed — set_arm_mode + "
-                        "enable_arm without a fresh buffered target risks snapping the "
-                        "arm to a stale or empty target. Power-cycle the arm to force "
-                        "the cold reset path."
-                    ) from exc
-                # Order matters: mode first (controller knows what to do with the
-                # buffered target), then enable_arm (motors energize and servo to
-                # the now-non-stale target).
-                self._iface.set_arm_mode()
-                self._iface.enable_arm()
-                # Don't call enable_gripper here — empirically it stays enabled
-                # across sessions, and an extra call is no-op. But verify.
+                self._engage_controller()
                 self._wait_for(self._iface.is_arm_enabled, "arm")
             else:
                 piper_init.reset_arm(self._iface)
-                self._iface.enable_arm()
                 self._iface.enable_gripper()
-                # piper_init.reset_arm sets arm_controller and move_mode but
-                # leaves ctrl_mode at firmware default STANDBY — motors are
-                # energized but the controller does not act on buffered
-                # commands. Explicitly set CAN_COMMAND ctrl_mode here so the
-                # cold path ends in the same servoing state as the warm path.
-                self._iface.set_arm_mode()
+                self._engage_controller()
                 self._wait_for(self._iface.is_arm_enabled, "arm")
                 self._wait_for(self._iface.is_gripper_enabled, "gripper")
             self._reset_done = True
@@ -258,6 +226,36 @@ class PiperRobot(Robot):
         except Exception:
             pass
         return False
+
+    def _engage_controller(self) -> None:
+        """Engage the firmware controller for active servoing.
+
+        Required ordering (empirically determined):
+          1. Pre-seed firmware buffer with current observed pose, so
+             when servoing engages the target is fresh, not stale.
+          2. set_arm_mode() flips ctrl_mode to CAN_COMMAND.
+          3. enable_arm() commits the engage. enable_arm AFTER
+             set_arm_mode is what actually starts servoing — calling
+             it before set_arm_mode (as piper_init.reset_arm does
+             internally) leaves the controller in a state where buffered
+             commands flow but no motion happens.
+
+        Caller is responsible for arm being electrically enabled before
+        this is called (warm: already enabled; cold: reset_arm did it).
+        """
+        try:
+            current_arm = self._iface.get_joint_positions()
+            current_gripper, _ = self._iface.get_gripper_state()
+            self._iface.command_joint_positions(current_arm)
+            self._iface.command_gripper(position=float(current_gripper))
+            time.sleep(0.2)
+        except Exception as exc:
+            raise RuntimeError(
+                "PiperRobot: failed to pre-seed current pose before "
+                "controller engage. Power-cycle and try again."
+            ) from exc
+        self._iface.set_arm_mode()
+        self._iface.enable_arm()
 
     def _read_state(self, force: bool = False) -> None:
         """Refresh tick-cache from the SDK. Reuses the cache if <1 ms old.
