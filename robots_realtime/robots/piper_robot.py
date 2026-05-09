@@ -1,3 +1,9 @@
+# NOTE: PiperRobot.command_joint_pos performs a synchronous CAN write
+# via piper_control. Sessions using PiperRobot MUST set poll_freq on
+# the RobotNode (or wrap the command path in a buffered thread, à la
+# franka_osc.py). Default subscriber_driven mode runs RobotNode flat-
+# out and saturates the CAN bus — observed at ~5.5 kHz with no
+# poll_freq on hardware.
 """Piper adapter — wraps Reimagine-Robotics piper_control to expose the
 robots_realtime Robot duck-typed protocol.
 

@@ -22,3 +22,4 @@ nodes:
     name: piper
     cmd_topic: hold_left/joint_pos
     robot_config: robot_configs/piper/single.yaml
+    poll_freq: 200
