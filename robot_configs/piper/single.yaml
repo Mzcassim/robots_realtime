@@ -1,0 +1,5 @@
+_target_: robots_realtime.robots.piper_robot.PiperRobot
+can_port: can0
+reset_on_init: true
+# joint_limits: null    # default: use SDK-exposed limits (PiperInterface.joint_limits)
+# gripper_limits: null  # default: [0.0, PiperInterface.gripper_angle_max]
