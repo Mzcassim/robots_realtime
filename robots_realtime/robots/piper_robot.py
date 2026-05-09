@@ -14,6 +14,15 @@ collision. PiperRobot detects already-enabled state and skips
 reset_arm in that case. If you need a hard reset on a warm arm,
 physically support the arm first or power-cycle it.
 
+SHUTDOWN: Sessions ending normally leave motors enabled, holding the
+last commanded pose. This avoids the disable-induced gravity drop on
+warm re-runs. To actively disable on close, construct with
+disable_on_close=True, or call close(disable=True) explicitly. To
+fully release motors, power-cycle the arm.
+
+stop() is a no-op (graceful — firmware holds last command).
+emergency_stop() cuts motor power; do not call on graceful exit.
+
 Piper's PiperInterface controls the 6-DOF arm in radians and exposes the
 gripper through a separate command_gripper(position, effort) API. To
 match the i2rt MotorChainRobot (YAM) convention used elsewhere in this
@@ -66,10 +75,12 @@ class PiperRobot(Robot):
         reset_on_init: bool = True,
         joint_limits: Optional[List[Tuple[float, float]]] = None,
         gripper_limits: Optional[Tuple[float, float]] = None,
+        disable_on_close: bool = False,
     ) -> None:
         self._can_port = can_port
         self._iface = piper_interface.PiperInterface(can_port=can_port)
         self._reset_done = False
+        self._disable_on_close = bool(disable_on_close)
 
         # Reset + explicit enable. piper_init.reset_arm alone has been observed
         # to leave the arm in a state where commands return SEND_MESSAGE_FAILED
@@ -271,10 +282,57 @@ class PiperRobot(Robot):
         }
 
     def stop(self) -> None:
-        """Emergency-stop hook. RobotNode.cleanup() probes for this via hasattr
-        (robot_node.py:188) — name must remain exactly ``stop``.
+        """Graceful stop hook called by RobotNode.cleanup() on session
+        shutdown. NO-OP by design: piper_control firmware holds the
+        last commanded pose when commands stop arriving, which is the
+        desired behavior. Do NOT call set_emergency_stop here — that
+        would cut motor power and cause a gravity drop, breaking the
+        warm-skip re-run path in __init__.
+
+        For an actual emergency stop, call self.emergency_stop()
+        directly or use the e-stop hardware button.
+        """
+        return
+
+    def emergency_stop(self) -> None:
+        """Hardware-software emergency stop — cuts motor power
+        immediately. Arm WILL fall under gravity if loaded. Use only
+        for actual emergencies; not for normal session teardown.
         """
         try:
             self._iface.set_emergency_stop()
         except Exception:
-            logger.exception("PiperRobot.stop: set_emergency_stop failed")
+            logger.exception("PiperRobot.emergency_stop failed")
+
+    def close(self, disable: bool = False) -> None:
+        """Best-effort safe shutdown.
+
+        By default, leaves the arm and gripper ENABLED, holding the
+        last commanded pose. This allows re-running rr-session against
+        the same warm arm without going through reset_arm's disable-
+        then-enable cycle, which on a loaded arm causes a visible
+        gravity drop and a snap-back to the previously cached target.
+
+        Pass disable=True to actively cut motor power on shutdown —
+        only do this when the arm is supported externally or has been
+        commanded to a stable resting pose. To fully release the
+        motors, power-cycle the arm.
+        """
+        if not disable:
+            return
+        try:
+            self._iface.disable_arm()
+        except Exception:
+            logger.exception("PiperRobot.close: disable_arm failed")
+        try:
+            self._iface.disable_gripper()
+        except Exception:
+            logger.exception("PiperRobot.close: disable_gripper failed")
+
+    def __del__(self) -> None:
+        # getattr-with-default because attributes may already be torn down
+        # at interpreter shutdown.
+        try:
+            self.close(disable=getattr(self, "_disable_on_close", False))
+        except Exception:
+            pass
