@@ -82,6 +82,11 @@ class PiperRobot(Robot):
         self._reset_done = False
         self._disable_on_close = bool(disable_on_close)
 
+        # Wait for the SDK's CAN-frame state cache to populate before any
+        # warm/cold detection runs — the very first call to is_*_enabled
+        # returns the default False regardless of hardware state.
+        self._wait_for_fresh_state()
+
         # Reset + explicit enable. piper_init.reset_arm alone has been observed
         # to leave the arm in a state where commands return SEND_MESSAGE_FAILED
         # under sustained load, so we additionally enable arm + gripper and
@@ -92,13 +97,13 @@ class PiperRobot(Robot):
         # SAFETY: piper_init.reset_arm internally calls disable_arm before
         # re-enabling. On a cold arm (already disabled) that's a no-op; on
         # a warm/loaded arm it causes a momentary motor cut and gravity
-        # drop. Skip reset_arm when both arm and gripper already report
-        # enabled — they're already in the state we want.
+        # drop. Skip reset_arm when the arm reads warm via _is_warm()
+        # (fully-enabled OR STANDBY with energized motors holding pose).
         if reset_on_init:
-            if self._iface.is_arm_enabled() and self._iface.is_gripper_enabled():
+            if self._is_warm():
                 logger.info(
-                    "PiperRobot: arm+gripper already enabled, skipping reset_arm "
-                    "to avoid disable-induced drop."
+                    "PiperRobot: arm appears warm (enabled or holding via STANDBY); "
+                    "skipping reset_arm to avoid disable-induced drop."
                 )
             else:
                 piper_init.reset_arm(self._iface)
@@ -165,6 +170,49 @@ class PiperRobot(Robot):
             f"PiperRobot: {name} did not report enabled within "
             f"{timeout_s}s. Power-cycle the arm and check the CAN bus."
         )
+
+    def _wait_for_fresh_state(self, timeout_s: float = 1.5,
+                              poll_interval_s: float = 0.1) -> None:
+        """Block briefly until PiperInterface's CAN-frame state cache
+        is populated. The first call to is_*_enabled() after
+        construction returns the default (False) regardless of true
+        hardware state, because the cache hasn't seen any feedback
+        frames yet. This helper just waits for cache warm-up.
+        Times out silently — the subsequent warm-detect check will
+        handle whatever state we end up in.
+        """
+        import time
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            # Any True flip on either flag means we've seen at least
+            # one feedback frame — cache is now live.
+            if self._iface.is_arm_enabled() or self._iface.is_gripper_enabled():
+                return
+            time.sleep(poll_interval_s)
+        # Timeout is OK: arm may genuinely be cold/disabled.
+
+    def _is_warm(self) -> bool:
+        """Return True if the arm is in any state where reset_arm
+        would cause a disable-induced drop. Includes both fully-
+        enabled and STANDBY (motors holding pose, control loop idle).
+        """
+        # Direct boolean flags catch the "actively enabled" case.
+        if self._iface.is_arm_enabled() and self._iface.is_gripper_enabled():
+            return True
+        # arm_status / control_mode = 0 with non-zero joint feedback
+        # indicates STANDBY with energized motors — also unsafe to reset.
+        # If joint positions are reading non-zero/non-stale, motors
+        # have power.
+        try:
+            pos = self._iface.get_joint_positions()
+            # If we got non-trivial readings, the firmware is talking
+            # to us. Combined with arm_status reporting NORMAL (0),
+            # treat as warm.
+            if any(abs(p) > 1e-4 for p in pos):
+                return True
+        except Exception:
+            pass
+        return False
 
     def _read_state(self, force: bool = False) -> None:
         """Refresh tick-cache from the SDK. Reuses the cache if <1 ms old.
