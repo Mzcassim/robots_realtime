@@ -94,21 +94,25 @@ class PiperRobot(Robot):
         # status propagates asynchronously on cold-start, so poll with a
         # bounded timeout rather than checking immediately.
         #
-        # SAFETY: piper_init.reset_arm internally does an equivalent sequence
-        # (pre-seed → set_arm_mode → enable_arm) but wraps it in disable_arm
-        # → enable_arm. The disable step briefly cuts motor power, which on
-        # a warm/loaded arm causes a visible gravity drop and risk of self-
-        # collision. On a cold arm (motors already off) it's a no-op.
+        # SAFETY: piper_init.reset_arm sets arm_controller and move_mode and
+        # wraps an enable cycle in disable_arm → enable_arm. It does NOT set
+        # ctrl_mode — the firmware default is STANDBY, where motors energize
+        # but the controller does not act on buffered commands (commands
+        # flow in, no motion). Both paths below therefore call set_arm_mode()
+        # explicitly to put ctrl_mode into CAN_COMMAND so the controller
+        # servos buffered targets. The disable_arm step inside reset_arm
+        # briefly cuts motor power, which on a warm/loaded arm causes a
+        # visible gravity drop and risk of self-collision. On a cold arm
+        # (motors already off) it's a no-op.
         #
-        # The warm path below replicates the same transition WITHOUT the
+        # The warm path below replicates the same end-state WITHOUT the
         # disable, in this exact order:
         #   1. Pre-seed current pose into the firmware command buffer —
         #      without this, set_arm_mode + enable_arm would commit a
         #      stale or empty target and snap the arm.
-        #   2. set_arm_mode() transitions the controller from STANDBY to
-        #      POSITION_VELOCITY (CAN_CTRL).
-        #   3. enable_arm() energizes the motors, which then servo to the
-        #      now-fresh buffered target.
+        #   2. set_arm_mode() flips ctrl_mode from STANDBY to CAN_COMMAND.
+        #   3. enable_arm() energizes the motors (idempotent on warm arm),
+        #      which then servo to the now-fresh buffered target.
         # Skip reset_arm when _is_warm() reports the arm is fully-enabled
         # or in STANDBY with energized motors holding pose.
         if reset_on_init:
@@ -144,6 +148,12 @@ class PiperRobot(Robot):
                 piper_init.reset_arm(self._iface)
                 self._iface.enable_arm()
                 self._iface.enable_gripper()
+                # piper_init.reset_arm sets arm_controller and move_mode but
+                # leaves ctrl_mode at firmware default STANDBY — motors are
+                # energized but the controller does not act on buffered
+                # commands. Explicitly set CAN_COMMAND ctrl_mode here so the
+                # cold path ends in the same servoing state as the warm path.
+                self._iface.set_arm_mode()
                 self._wait_for(self._iface.is_arm_enabled, "arm")
                 self._wait_for(self._iface.is_gripper_enabled, "gripper")
             self._reset_done = True
