@@ -94,17 +94,52 @@ class PiperRobot(Robot):
         # status propagates asynchronously on cold-start, so poll with a
         # bounded timeout rather than checking immediately.
         #
-        # SAFETY: piper_init.reset_arm internally calls disable_arm before
-        # re-enabling. On a cold arm (already disabled) that's a no-op; on
-        # a warm/loaded arm it causes a momentary motor cut and gravity
-        # drop. Skip reset_arm when the arm reads warm via _is_warm()
-        # (fully-enabled OR STANDBY with energized motors holding pose).
+        # SAFETY: piper_init.reset_arm internally does an equivalent sequence
+        # (pre-seed → set_arm_mode → enable_arm) but wraps it in disable_arm
+        # → enable_arm. The disable step briefly cuts motor power, which on
+        # a warm/loaded arm causes a visible gravity drop and risk of self-
+        # collision. On a cold arm (motors already off) it's a no-op.
+        #
+        # The warm path below replicates the same transition WITHOUT the
+        # disable, in this exact order:
+        #   1. Pre-seed current pose into the firmware command buffer —
+        #      without this, set_arm_mode + enable_arm would commit a
+        #      stale or empty target and snap the arm.
+        #   2. set_arm_mode() transitions the controller from STANDBY to
+        #      POSITION_VELOCITY (CAN_CTRL).
+        #   3. enable_arm() energizes the motors, which then servo to the
+        #      now-fresh buffered target.
+        # Skip reset_arm when _is_warm() reports the arm is fully-enabled
+        # or in STANDBY with energized motors holding pose.
         if reset_on_init:
             if self._is_warm():
                 logger.info(
-                    "PiperRobot: arm appears warm (enabled or holding via STANDBY); "
-                    "skipping reset_arm to avoid disable-induced drop."
+                    "PiperRobot: arm appears warm; pre-seeding current pose, "
+                    "transitioning controller to POSITION_VELOCITY, and re-enabling "
+                    "arm without disable cycle."
                 )
+                try:
+                    current_arm = self._iface.get_joint_positions()
+                    current_gripper, _ = self._iface.get_gripper_state()
+                    self._iface.command_joint_positions(current_arm)
+                    self._iface.command_gripper(position=float(current_gripper))
+                    time.sleep(0.2)  # let buffer write propagate before mode/enable
+                except Exception as exc:
+                    raise RuntimeError(
+                        "PiperRobot: failed to pre-seed current pose before warm "
+                        "controller transition. Refusing to proceed — set_arm_mode + "
+                        "enable_arm without a fresh buffered target risks snapping the "
+                        "arm to a stale or empty target. Power-cycle the arm to force "
+                        "the cold reset path."
+                    ) from exc
+                # Order matters: mode first (controller knows what to do with the
+                # buffered target), then enable_arm (motors energize and servo to
+                # the now-non-stale target).
+                self._iface.set_arm_mode()
+                self._iface.enable_arm()
+                # Don't call enable_gripper here — empirically it stays enabled
+                # across sessions, and an extra call is no-op. But verify.
+                self._wait_for(self._iface.is_arm_enabled, "arm")
             else:
                 piper_init.reset_arm(self._iface)
                 self._iface.enable_arm()
