@@ -61,21 +61,15 @@ class PiperRobot(Robot):
         # Reset + explicit enable. piper_init.reset_arm alone has been observed
         # to leave the arm in a state where commands return SEND_MESSAGE_FAILED
         # under sustained load, so we additionally enable arm + gripper and
-        # verify both before declaring the robot commandable.
+        # verify both before declaring the robot commandable. The is_*_enabled
+        # status propagates asynchronously on cold-start, so poll with a
+        # bounded timeout rather than checking immediately.
         if reset_on_init:
             piper_init.reset_arm(self._iface)
             self._iface.enable_arm()
             self._iface.enable_gripper()
-            if not self._iface.is_arm_enabled():
-                raise RuntimeError(
-                    "PiperRobot: arm did not enable after reset_arm + enable_arm. "
-                    "Power-cycle the arm and check the CAN bus."
-                )
-            if not self._iface.is_gripper_enabled():
-                raise RuntimeError(
-                    "PiperRobot: gripper did not enable after enable_gripper. "
-                    "Power-cycle the arm and check the CAN bus."
-                )
+            self._wait_for(self._iface.is_arm_enabled, "arm")
+            self._wait_for(self._iface.is_gripper_enabled, "gripper")
             self._reset_done = True
 
         # Joint limits: caller override wins, else read the SDK's exposed limits.
@@ -121,6 +115,20 @@ class PiperRobot(Robot):
 
     def num_dofs(self) -> int:
         return NUM_ARM_JOINTS + 1   # 6 arm joints + 1 gripper at index -1
+
+    def _wait_for(self, predicate, name: str, timeout_s: float = 2.0,
+                  poll_interval_s: float = 0.05) -> None:
+        """Poll predicate() until True or timeout. Used to handle
+        async state propagation on cold-start enable calls."""
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(poll_interval_s)
+        raise RuntimeError(
+            f"PiperRobot: {name} did not report enabled within "
+            f"{timeout_s}s. Power-cycle the arm and check the CAN bus."
+        )
 
     def _read_state(self, force: bool = False) -> None:
         """Refresh tick-cache from the SDK. Reuses the cache if <1 ms old.
