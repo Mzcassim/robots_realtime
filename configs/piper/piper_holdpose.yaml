@@ -1,0 +1,21 @@
+version: "1"
+
+session:
+  save_root: recordings
+  auto_record_duration: 30.0   # 30s of hold-pose tracking, then session exits
+
+nodes:
+  - type: AgentNode
+    name: hold_left
+    agent_class: robots_realtime.agents.teleoperation.hold_pose_agent:HoldPoseAgent
+    agent_kwargs:
+      state_key: state
+      gripper_max_m: 0.1       # matches PiperRobot._gripper_hi default
+    loop_mode: subscriber_driven
+    state_topics:
+      state: piper/joint_state
+
+  - type: RobotNode
+    name: piper
+    cmd_topic: hold_left/joint_pos
+    robot_config: robot_configs/piper/single.yaml
