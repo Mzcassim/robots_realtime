@@ -7,6 +7,13 @@
 """Piper adapter — wraps Reimagine-Robotics piper_control to expose the
 robots_realtime Robot duck-typed protocol.
 
+WARNING: On a warm/enabled arm, do NOT call piper_init.reset_arm — it
+briefly disables the motors via disable_arm before re-enabling, which
+on a loaded arm causes a visible gravity drop and risk of self-
+collision. PiperRobot detects already-enabled state and skips
+reset_arm in that case. If you need a hard reset on a warm arm,
+physically support the arm first or power-cycle it.
+
 Piper's PiperInterface controls the 6-DOF arm in radians and exposes the
 gripper through a separate command_gripper(position, effort) API. To
 match the i2rt MotorChainRobot (YAM) convention used elsewhere in this
@@ -70,12 +77,24 @@ class PiperRobot(Robot):
         # verify both before declaring the robot commandable. The is_*_enabled
         # status propagates asynchronously on cold-start, so poll with a
         # bounded timeout rather than checking immediately.
+        #
+        # SAFETY: piper_init.reset_arm internally calls disable_arm before
+        # re-enabling. On a cold arm (already disabled) that's a no-op; on
+        # a warm/loaded arm it causes a momentary motor cut and gravity
+        # drop. Skip reset_arm when both arm and gripper already report
+        # enabled — they're already in the state we want.
         if reset_on_init:
-            piper_init.reset_arm(self._iface)
-            self._iface.enable_arm()
-            self._iface.enable_gripper()
-            self._wait_for(self._iface.is_arm_enabled, "arm")
-            self._wait_for(self._iface.is_gripper_enabled, "gripper")
+            if self._iface.is_arm_enabled() and self._iface.is_gripper_enabled():
+                logger.info(
+                    "PiperRobot: arm+gripper already enabled, skipping reset_arm "
+                    "to avoid disable-induced drop."
+                )
+            else:
+                piper_init.reset_arm(self._iface)
+                self._iface.enable_arm()
+                self._iface.enable_gripper()
+                self._wait_for(self._iface.is_arm_enabled, "arm")
+                self._wait_for(self._iface.is_gripper_enabled, "gripper")
             self._reset_done = True
 
         # Joint limits: caller override wins, else read the SDK's exposed limits.
